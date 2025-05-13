@@ -82,7 +82,13 @@ def main(args: argparse.Namespace) -> None:
     print("Device: {}".format(device))
     if device == "cpu":
         raise ValueError("GPU not detected!")
+    print("CUDA is available:", torch.cuda.is_available())
+    print("CUDA device count:", torch.cuda.device_count())
 
+    for i in range(torch.cuda.device_count()):
+        print(f"Device {i}: {torch.cuda.get_device_name(i)}")
+
+    print("Current device index:", torch.cuda.current_device())
     # define model architecture
     model = get_model(model_config, device)
 
