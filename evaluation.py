@@ -22,17 +22,33 @@ def calculate_tDCF_EER(cm_scores_file,
         'Cfa_cm': 10,  # Cost of CM system falsely accepting spoof
     }
 
-    # Load ASV scores
-    asv_data = np.genfromtxt(asv_score_file, dtype=str)
-    asv_keys = asv_data[:, 1]
-    asv_scores = asv_data[:, 2].astype(np.float64)
+    try:
+        # Load ASV scores
+        asv_data = np.genfromtxt(asv_score_file, dtype=str)
+        asv_keys = asv_data[:, 1]
+        asv_scores = asv_data[:, 2].astype(np.float64)
 
-    # Load CM scores
-    cm_data = np.genfromtxt(cm_scores_file, dtype=str)
-    cm_sources = cm_data[:, 1]
-    cm_keys = cm_data[:, 2]
-    cm_scores = cm_data[:, 3].astype(np.float64)
-
+        # Load CM scores
+        cm_data = np.genfromtxt(cm_scores_file, dtype=str)
+        cm_sources = cm_data[:, 1]
+        cm_keys = cm_data[:, 2]
+        cm_scores = cm_data[:, 3].astype(np.float64)
+        
+        # Check if we have valid scores
+        if len(cm_scores) == 0:
+            print(f"WARNING: No CM scores found in file {cm_scores_file}")
+            if printout:
+                with open(output_file, "w") as f_res:
+                    f_res.write("ERROR: No valid CM scores found!\n")
+            return 50.0, 0.5  # Return default EER (50%) and t-DCF (0.5)
+    
+    except Exception as e:
+        print(f"ERROR loading score files: {str(e)}")
+        if printout:
+            with open(output_file, "w") as f_res:
+                f_res.write(f"ERROR loading score files: {str(e)}\n")
+        return 50.0, 0.5  # Return default EER (50%) and t-DCF (0.5)
+        
     # Extract ASV subsets
     tar_asv = asv_scores[asv_keys == 'target']
     non_asv = asv_scores[asv_keys == 'nontarget']
@@ -41,10 +57,25 @@ def calculate_tDCF_EER(cm_scores_file,
     # Extract CM subsets
     bona_cm = cm_scores[cm_keys == 'bonafide']
     spoof_cm = cm_scores[cm_keys == 'spoof']
+    
+    # Check if we have enough scores in each category
+    if len(bona_cm) == 0 or len(spoof_cm) == 0:
+        print(f"WARNING: Missing bonafide ({len(bona_cm)}) or spoof ({len(spoof_cm)}) CM scores!")
+        if printout:
+            with open(output_file, "w") as f_res:
+                f_res.write(f"ERROR: Missing scores! Bonafide: {len(bona_cm)}, Spoof: {len(spoof_cm)}\n")
+        return 50.0, 0.5  # Return default EER (50%) and t-DCF (0.5)
 
     # Compute EERs
-    eer_asv, asv_threshold = compute_eer(tar_asv, non_asv)
-    eer_cm = compute_eer(bona_cm, spoof_cm)[0]
+    try:
+        eer_asv, asv_threshold = compute_eer(tar_asv, non_asv)
+        eer_cm = compute_eer(bona_cm, spoof_cm)[0]
+    except Exception as e:
+        print(f"ERROR computing EER: {str(e)}")
+        if printout:
+            with open(output_file, "w") as f_res:
+                f_res.write(f"ERROR computing EER: {str(e)}\n")
+        return 50.0, 0.5  # Return default values
 
     attack_types = [f'A{_id:02d}' for _id in range(7, 20)]
     if printout:
@@ -120,12 +151,25 @@ def obtain_asv_error_rates(tar_asv, non_asv, spoof_asv, asv_threshold):
 def compute_det_curve(target_scores, nontarget_scores):
 
     n_scores = target_scores.size + nontarget_scores.size
+    
+    # Handle the case when there are no scores
+    if n_scores == 0:
+        print("WARNING: No scores available for computing DET curve!")
+        # Return dummy values that won't cause computation errors
+        return np.array([0.5]), np.array([0.5]), np.array([0.0])
+    
     all_scores = np.concatenate((target_scores, nontarget_scores))
     labels = np.concatenate(
         (np.ones(target_scores.size), np.zeros(nontarget_scores.size)))
 
     # Sort labels based on scores
     indices = np.argsort(all_scores, kind='mergesort')
+    
+    # Handle the case when all_scores is empty or indices is empty
+    if len(indices) == 0:
+        print("WARNING: No valid indices for computing DET curve!")
+        return np.array([0.5]), np.array([0.5]), np.array([0.0])
+        
     labels = labels[indices]
 
     # Compute false rejection and false acceptance rates

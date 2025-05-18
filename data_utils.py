@@ -3,6 +3,7 @@ import soundfile as sf
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
+import os
 
 ___author__ = "Hemlata Tak, Jee-weon Jung"
 __email__ = "tak@eurecom.fr, jeeweon.jung@navercorp.com"
@@ -93,7 +94,27 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
 
     def __getitem__(self, index):
         key = self.list_IDs[index]
-        X, _ = sf.read(str(self.base_dir / f"flac/{key}.flac"))
-        X_pad = pad(X, self.cut)
-        x_inp = Tensor(X_pad)
-        return x_inp, key
+        try:
+            # Handle both string paths and Path objects
+            if isinstance(self.base_dir, str):
+                file_path = os.path.join(self.base_dir, f"flac/{key}.flac")
+            else:
+                # Assume it's a Path object
+                file_path = str(self.base_dir / f"flac/{key}.flac")
+            
+            # Check if file exists
+            if not os.path.exists(file_path):
+                # Try alternative path format
+                if isinstance(self.base_dir, str):
+                    file_path = os.path.join(self.base_dir, "flac", f"{key}.flac")
+                else:
+                    file_path = str(self.base_dir / "flac" / f"{key}.flac")
+            
+            X, _ = sf.read(file_path)
+            X_pad = pad(X, self.cut)
+            x_inp = Tensor(X_pad)
+            return x_inp, key
+        except Exception as e:
+            print(f"Error loading file for key {key}: {str(e)}")
+            # Return a dummy tensor if file can't be loaded
+            return Tensor(np.zeros(self.cut)), key

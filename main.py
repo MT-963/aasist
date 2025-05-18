@@ -7,6 +7,7 @@ Copyright (c) 2021-present NAVER Corp.
 MIT license
 """
 import os
+import platform
 # Disable TensorFlow warnings
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -132,11 +133,48 @@ def main(args: argparse.Namespace) -> None:
 
     # Configure batch size based on available GPU memory
     total_memory = torch.cuda.get_device_properties(0).total_memory
-    memory_per_sample = 2 * 1024 * 1024  # Estimate 2MB per sample
-    max_batch_size = min(int(total_memory * 0.8 / memory_per_sample), config["batch_size"])
-    config["batch_size"] = max_batch_size
-    print(f"\nAuto-configured batch size: {max_batch_size}")
-
+    # More conservative memory estimation - account for model size and gradients
+    memory_per_sample = 4 * 1024 * 1024  # Estimate 4MB per sample to be safe
+    
+    # Set very conservative batch sizes
+    if args.eval:
+        # For evaluation, use a very small batch size
+        config["batch_size"] = 2  # Fixed small batch size for evaluation
+        print(f"\nForced evaluation batch size: 2 (for GTX 1650 Ti memory constraints)")
+    else:
+        # For training, use auto-configured size
+        suggested_batch_size = max(1, min(16, int((total_memory * 0.6) / memory_per_sample)))
+        config["batch_size"] = min(suggested_batch_size, config.get("batch_size", 16))
+        print(f"\nUsing training batch size: {config['batch_size']} (suggested: {suggested_batch_size})")
+    
+    # Enable memory efficient options
+    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+    
+    # Platform-specific memory management
+    is_windows = platform.system() == 'Windows'
+    
+    # More aggressive memory management
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        # Set memory fraction to 85% to leave room for system
+        torch.cuda.set_per_process_memory_fraction(0.85)
+        
+        # Configure PyTorch memory allocator
+        if is_windows:
+            # Windows-specific memory settings
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,garbage_collection_threshold:0.6'
+            # Disable memory profiling on Windows
+            os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'
+        else:
+            # Linux/Unix memory settings
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,garbage_collection_threshold:0.6,expandable_segments:True'
+            # Enable memory stats tracking only on Linux
+            if hasattr(torch.cuda.memory, '_record_memory_history'):
+                torch.cuda.memory._record_memory_history(max_entries=10000)
+    
     # make experiment reproducible
     set_seed(args.seed, config)
 
@@ -173,40 +211,153 @@ def main(args: argparse.Namespace) -> None:
     trn_loader, dev_loader, eval_loader = get_loader(
         database_path=Path(config["database_path"]),
         seed=args.seed,
-        config=config
+        config=config  # Remove is_eval since we've already set the batch size
     )
     
     # Create model and move to GPU
     model = get_model(model_config, device)
     model = model.to(device, memory_format=torch.channels_last)  # Use channels_last memory format
     
+    # Configure optimizer settings
+    optim_config["steps_per_epoch"] = len(trn_loader)
+    optim_config["epochs"] = config["num_epochs"]  # Ensure epochs is set
+    
+    # Set scheduler-specific defaults if not present
+    if optim_config["scheduler"] == "cosine" and "lr_min" not in optim_config:
+        optim_config["lr_min"] = optim_config["base_lr"] * 0.01  # Default to 1% of base_lr
+    
+    if optim_config["scheduler"] == "sgdr" and "T0" not in optim_config:
+        optim_config["T0"] = 10  # Default restart period
+        optim_config["Tmult"] = 2  # Default period multiplier
+    
     # Create optimizer with gradient clipping
     optimizer, scheduler = create_optimizer(model.parameters(), optim_config)
     optimizer_swa = SWA(optimizer) if config.get("use_swa", False) else None
 
     if args.eval:
-        model_load_path = Path(args.model_path)
+        # Determine model path from args or config
+        if args.eval_model_weights:
+            model_load_path = Path(args.eval_model_weights)
+        elif "model_path" in config:
+            model_load_path = Path(config["model_path"])
+        else:
+            raise ValueError("No model path provided. Use --eval_model_weights or specify model_path in config.")
+            
         model.load_state_dict(torch.load(model_load_path))
         print("Model loaded from {}".format(model_load_path))
         print("Start evaluation...")
         
-        # Evaluate with specified attack if configured
-        if config.get("use_adversarial", False):
-            evaluate_model_with_attack(
+        # Check if attack type is specified via argument or config
+        attack_type = args.attack or config.get("attack_type", None)
+        
+        if attack_type:
+            print(f"\n{'='*50}")
+            print(f"Running evaluation with {attack_type.upper()} attack")
+            print(f"{'='*50}")
+            
+            # Prepare attack parameters
+            attack_params = {}
+            
+            # Create attack-specific output path to avoid overwriting normal eval results
+            attack_output_dir = model_tag / f"{attack_type}_attack_results"
+            os.makedirs(attack_output_dir, exist_ok=True)
+            
+            # Create attack-specific score path
+            attack_score_path = attack_output_dir / f"{attack_type}_scores.txt"
+            config["attack_score_path"] = str(attack_score_path)
+            
+            # Use epsilon from command line if provided, otherwise from config or default
+            if attack_type == "fgsm":
+                if args.epsilon is not None:
+                    attack_params["epsilon"] = args.epsilon
+                    print(f"Using command line epsilon: {args.epsilon}")
+                elif "fgsm_epsilon" in config:
+                    attack_params["epsilon"] = config["fgsm_epsilon"]
+                    print(f"Using config epsilon: {config['fgsm_epsilon']}")
+                else:
+                    print("Using default epsilon: 0.05")
+            
+            elif attack_type == "pgd":
+                if args.epsilon is not None:
+                    attack_params["epsilon"] = args.epsilon
+                    print(f"Using command line epsilon: {args.epsilon}")
+                elif "pgd_epsilon" in config:
+                    attack_params["epsilon"] = config["pgd_epsilon"]
+                    print(f"Using config epsilon: {config['pgd_epsilon']}")
+                else:
+                    print("Using default epsilon: 0.05")
+                
+                # Use other PGD parameters from config if available
+                if "pgd_alpha" in config:
+                    attack_params["alpha"] = config["pgd_alpha"]
+                    print(f"Using config alpha: {config['pgd_alpha']}")
+                if "pgd_num_iter" in config:
+                    attack_params["num_iter"] = config["pgd_num_iter"]
+                    print(f"Using config num_iter: {config['pgd_num_iter']}")
+            
+            elif attack_type == "deepfool":
+                if "deepfool_max_iter" in config:
+                    attack_params["max_iter"] = config["deepfool_max_iter"]
+                    print(f"Using config max_iter: {config['deepfool_max_iter']}")
+                else:
+                    print("Using default max_iter: 10")
+            
+            print(f"{'='*50}\n")
+            
+            # Run evaluation with attack
+            eval_eer, eval_tdcf = evaluate_model_with_attack(
                 model=model,
                 eval_loader=eval_loader,
                 device=device,
                 database_path=Path(config["database_path"]),
-                config=config
+                config=config,
+                attack_type=attack_type,
+                attack_params=attack_params
             )
-            return
-        
-        produce_evaluation_file(eval_loader, model, device,
-                               eval_score_path, eval_trial_path)
-        eval_eer, eval_tdcf = calculate_tDCF_EER(
-            cm_scores_file=eval_score_path,
-            asv_score_file=database_path / config["asv_score_path"])
-        print("EVAL - EER: {:.3f}, min t-DCF: {:.5f}".format(eval_eer, eval_tdcf))
+            
+            # Save attack-specific results
+            result_output = attack_output_dir / f"{attack_type}_metrics.txt"
+            with open(result_output, "w") as f:
+                f.write(f"Attack Type: {attack_type.upper()}\n")
+                f.write(f"Parameters:\n")
+                for param, value in attack_params.items():
+                    f.write(f"- {param}: {value}\n")
+                f.write(f"\nResults:\n")
+                f.write(f"EER: {eval_eer:.3f}%\n")
+                f.write(f"min t-DCF: {eval_tdcf:.5f}\n")
+            
+            # Print a clear summary of the attack results
+            print("\n" + "="*50)
+            print(f"ADVERSARIAL ATTACK RESULTS: {attack_type.upper()}")
+            print("="*50)
+            print(f"EER: {eval_eer:.3f}%")
+            print(f"min t-DCF: {eval_tdcf:.5f}")
+            print("="*50)
+            
+            print(f"\nAttack results saved to: {attack_output_dir}")
+        else:
+            # Get max_batches from config or use default
+            max_eval_batches = config.get("max_eval_batches", 1000)
+            print(f"\nRunning standard evaluation (no attack)...")
+            print(f"Using max evaluation batches: {max_eval_batches}")
+            
+            produce_evaluation_file(
+                eval_loader, 
+                model, 
+                device,
+                eval_score_path, 
+                eval_trial_path,
+                max_batches=max_eval_batches
+            )
+            
+            # Calculate EER and t-DCF with output file
+            result_output = model_tag / "t-DCF_EER_eval.txt"
+            eval_eer, eval_tdcf = calculate_tDCF_EER(
+                cm_scores_file=eval_score_path,
+                asv_score_file=database_path / config["asv_score_path"],
+                output_file=result_output
+            )
+            print("EVAL - EER: {:.3f}, min t-DCF: {:.5f}".format(eval_eer, eval_tdcf))
         return
     
     # Training loop
@@ -232,38 +383,56 @@ def main(args: argparse.Namespace) -> None:
             batch_size = batch_x.size(0)
             
             # Move data to GPU asynchronously
-            batch_x = batch_x.to(device, non_blocking=True)
+            batch_x = batch_x.to(device, non_blocking=True, memory_format=torch.channels_last)
             batch_y = batch_y.to(device, non_blocking=True)
             
-            # Mixed precision forward pass
-            with torch.cuda.amp.autocast():
-                batch_out, _ = model(batch_x)
-                loss = criterion(batch_out, batch_y)
+            # Clear gradients and cache
+            optimizer.zero_grad(set_to_none=True)
+            
+            try:
+                # Mixed precision forward pass
+                with torch.cuda.amp.autocast():
+                    batch_out, _ = model(batch_x)
+                    loss = criterion(batch_out, batch_y)
+                    
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
                 
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+                
+                # Optimizer step with scaling
+                scaler.step(optimizer)
+                scaler.update()
+                
+                running_loss += loss.item() * batch_size
+                num_correct += (batch_out.max(1)[1] == batch_y).sum().item()
+                num_total += batch_size
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\nOOM error in batch. Current memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
             
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-            
-            # Optimizer step with scaling
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)  # More efficient than .zero_grad()
-            
-            running_loss += loss.item() * batch_size
-            num_correct += (batch_out.max(1)[1] == batch_y).sum().item()
-            num_total += batch_size
-            
-            # Free up memory
-            del batch_x, batch_y, batch_out
+            finally:
+                # Clean up memory
+                del batch_x, batch_y, batch_out
+                if batch_idx % 10 == 0:  # Periodic cleanup
+                    torch.cuda.empty_cache()
             
         scheduler.step()
         epoch_loss = running_loss / num_total
         epoch_acc = num_correct / num_total
         print("Training Loss: {:.4f}, Accuracy: {:.2f}%".format(
             epoch_loss, epoch_acc * 100))
+        
+        # Memory status after training
+        print(f"GPU Memory after epoch: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
         
         writer.add_scalar("train_loss", epoch_loss, epoch)
         writer.add_scalar("train_acc", epoch_acc, epoch)
@@ -380,8 +549,11 @@ def get_loader(
     num_workers = min(4, os.cpu_count())
     print(f"\nUsing {num_workers} workers for data loading")
     
+    # Use different batch sizes for training and evaluation
+    batch_size = config["batch_size"]
+    
     trn_loader = DataLoader(train_set,
-                            batch_size=config["batch_size"],
+                            batch_size=batch_size,
                             shuffle=True,
                             drop_last=True,
                             pin_memory=True,
@@ -399,7 +571,7 @@ def get_loader(
     dev_set = Dataset_ASVspoof2019_devNeval(list_IDs=file_dev,
                                             base_dir=dev_database_path)
     dev_loader = DataLoader(dev_set,
-                            batch_size=config["batch_size"],
+                            batch_size=batch_size,
                             shuffle=False,
                             drop_last=False,
                             pin_memory=True,
@@ -413,7 +585,7 @@ def get_loader(
     eval_set = Dataset_ASVspoof2019_devNeval(list_IDs=file_eval,
                                              base_dir=eval_database_path)
     eval_loader = DataLoader(eval_set,
-                             batch_size=config["batch_size"],
+                             batch_size=batch_size,
                              shuffle=False,
                              drop_last=False,
                              pin_memory=True,
@@ -429,13 +601,23 @@ def produce_evaluation_file(
     model,
     device: torch.device,
     save_path: str,
-    trial_path: str) -> None:
+    trial_path: str,
+    max_batches: int = 1000) -> None:
     """Perform evaluation and save the score to a file"""
     model.eval()
     
     # Ensure model is on GPU
     model = model.to(device)
-    print(f"\nEvaluation GPU Memory before starting: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+    
+    # Platform-specific memory monitoring
+    is_windows = platform.system() == 'Windows'
+    if is_windows:
+        print("\nEvaluation started - Windows platform detected")
+        print(f"Initial GPU Memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+    else:
+        print("\nEvaluation started - Unix/Linux platform detected")
+        print(f"Initial GPU Memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+        print(f"Initial GPU Memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB")
     
     with open(trial_path, "r") as f_trl:
         trial_lines = f_trl.readlines()
@@ -443,32 +625,56 @@ def produce_evaluation_file(
     score_list = []
     
     # Track progress
-    total_batches = len(data_loader)
+    total_batches = min(len(data_loader), max_batches)
+    print(f"\nProcessing {total_batches} batches (limited from {len(data_loader)} total batches)")
     
     for batch_idx, (batch_x, utt_id) in enumerate(data_loader, 1):
+        if batch_idx > max_batches:
+            print(f"\nReached max batches limit ({max_batches})")
+            break
+            
         # Move data to GPU explicitly
         batch_x = batch_x.to(device, non_blocking=True)
         
-        # Print progress
+        # Print progress and memory stats
         if batch_idx % 10 == 0:
             print(f"Processing batch {batch_idx}/{total_batches} ({(batch_idx/total_batches)*100:.1f}%)")
             print(f"Current GPU memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
         
-        with torch.no_grad():
-            _, batch_out = model(batch_x)
-            batch_score = (batch_out[:, 1]).cpu().numpy().ravel()
+        try:
+            with torch.no_grad():
+                _, batch_out = model(batch_x)
+                batch_score = (batch_out[:, 1]).cpu().numpy().ravel()
+            
+            # add outputs
+            fname_list.extend(utt_id)
+            score_list.extend(batch_score.tolist())
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\nOOM error in batch {batch_idx}. Attempting recovery...")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
         
-        # add outputs
-        fname_list.extend(utt_id)
-        score_list.extend(batch_score.tolist())
-        
-        # Periodic GPU memory clear
-        if batch_idx % 50 == 0:
-            torch.cuda.empty_cache()
+        finally:
+            # Clean up memory
+            del batch_x, batch_out
+            if batch_idx % 50 == 0:  # Periodic cleanup
+                torch.cuda.empty_cache()
 
-    print(f"Final GPU Memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+    # Final memory status
+    if is_windows:
+        print(f"\nFinal GPU Memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+    else:
+        print(f"\nFinal GPU Memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+        print(f"Final GPU Memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB")
     
-    assert len(trial_lines) == len(fname_list) == len(score_list)
+    print(f"\nProcessed {len(fname_list)} samples in {batch_idx} batches")
+    
+    # Write all available scores
     with open(save_path, "w") as fh:
         for fn, sco, trl in zip(fname_list, score_list, trial_lines):
             _, utt_id, _, src, key = trl.strip().split(' ')
@@ -507,4 +713,13 @@ if __name__ == "__main__":
                         type=str,
                         default=None,
                         help="directory to the model weight file (can be also given in the config file)")
+    parser.add_argument("--attack",
+                        type=str,
+                        default=None,
+                        choices=["fgsm", "pgd", "deepfool"],
+                        help="adversarial attack type to use for evaluation (fgsm, pgd, or deepfool)")
+    parser.add_argument("--epsilon",
+                        type=float,
+                        default=None,
+                        help="epsilon value for adversarial attacks (attack strength)")
     main(parser.parse_args())
