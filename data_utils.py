@@ -67,6 +67,7 @@ class Dataset_ASVspoof2019_train(Dataset):
         self.labels = labels
         self.base_dir = base_dir
         self.cut = 64600  # take ~4 sec audio (64600 samples)
+        print(f"Dataset base_dir: {self.base_dir}")  # Debug print
 
     def __len__(self):
         return len(self.list_IDs)
@@ -80,7 +81,11 @@ class Dataset_ASVspoof2019_train(Dataset):
             split = 'ASVspoof2019_LA_dev'
         else:  # LA_E_
             split = 'ASVspoof2019_LA_eval'
-        full_path = str(self.base_dir / split / 'flac' / f"{key}.flac")
+        # Remove any duplicate path components
+        base_path = str(self.base_dir).rstrip('/')
+        if base_path.endswith(split):
+            base_path = base_path[:-len(split)].rstrip('/')
+        full_path = f"{base_path}/{split}/flac/{key}.flac"
         print(f"Trying to access file at: {full_path}")  # Debug print
         X, _ = sf.read(full_path)
         X_pad = pad_random(X, self.cut)
@@ -96,6 +101,7 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
         self.list_IDs = list_IDs
         self.base_dir = base_dir
         self.cut = 64600  # take ~4 sec audio (64600 samples)
+        print(f"Dataset base_dir: {self.base_dir}")  # Debug print
 
     def __len__(self):
         return len(self.list_IDs)
@@ -109,7 +115,11 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
             split = 'ASVspoof2019_LA_dev'
         else:  # LA_E_
             split = 'ASVspoof2019_LA_eval'
-        full_path = str(self.base_dir / split / 'flac' / f"{key}.flac")
+        # Remove any duplicate path components
+        base_path = str(self.base_dir).rstrip('/')
+        if base_path.endswith(split):
+            base_path = base_path[:-len(split)].rstrip('/')
+        full_path = f"{base_path}/{split}/flac/{key}.flac"
         print(f"Trying to access file at: {full_path}")  # Debug print
         X, _ = sf.read(full_path)
         X_pad = pad(X, self.cut)
