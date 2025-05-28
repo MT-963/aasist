@@ -67,7 +67,6 @@ class Dataset_ASVspoof2019_train(Dataset):
         self.labels = labels
         self.base_dir = base_dir
         self.cut = 64600  # take ~4 sec audio (64600 samples)
-        print(f"Dataset base_dir: {self.base_dir}")  # Debug print
 
     def __len__(self):
         return len(self.list_IDs)
@@ -86,7 +85,6 @@ class Dataset_ASVspoof2019_train(Dataset):
         if base_path.endswith(split):
             base_path = base_path[:-len(split)].rstrip('/')
         full_path = f"{base_path}/{split}/flac/{key}.flac"
-        print(f"Trying to access file at: {full_path}")  # Debug print
         X, _ = sf.read(full_path)
         X_pad = pad_random(X, self.cut)
         x_inp = Tensor(X_pad)
@@ -101,7 +99,6 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
         self.list_IDs = list_IDs
         self.base_dir = base_dir
         self.cut = 64600  # take ~4 sec audio (64600 samples)
-        print(f"Dataset base_dir: {self.base_dir}")  # Debug print
 
     def __len__(self):
         return len(self.list_IDs)
@@ -120,7 +117,6 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
         if base_path.endswith(split):
             base_path = base_path[:-len(split)].rstrip('/')
         full_path = f"{base_path}/{split}/flac/{key}.flac"
-        print(f"Trying to access file at: {full_path}")  # Debug print
         X, _ = sf.read(full_path)
         X_pad = pad(X, self.cut)
         x_inp = Tensor(X_pad)
