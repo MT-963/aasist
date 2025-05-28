@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import warnings
+import gc
 from importlib import import_module
 from pathlib import Path
 from shutil import copy
@@ -26,6 +27,7 @@ from data_utils import (Dataset_ASVspoof2019_train,
                         Dataset_ASVspoof2019_devNeval, genSpoof_list)
 from evaluation import calculate_tDCF_EER
 from utils import create_optimizer, seed_worker, set_seed, str_to_bool
+from kaggle_fix import fix_kaggle_environment, enhance_model_training, training_step_with_amp
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -35,6 +37,11 @@ def main(args: argparse.Namespace) -> None:
     Main function.
     Trains, validates, and evaluates the ASVspoof detection model.
     """
+    # Fix Kaggle environment issues
+    print("Applying Kaggle environment fixes...")
+    memory_info = fix_kaggle_environment()
+    print(memory_info)
+    
     # load experiment configurations
     with open(args.config, "r") as f_json:
         config = json.loads(f_json.read())
@@ -134,9 +141,20 @@ def main(args: argparse.Namespace) -> None:
 
     # Training
     for epoch in range(config["num_epochs"]):
+        # Clear memory before each epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
         print("Start training epoch{:03d}".format(epoch))
         running_loss = train_epoch(trn_loader, model, optimizer, device,
                                    scheduler, config)
+        
+        # Clear memory after training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
         produce_evaluation_file(dev_loader, model, device,
                                 metric_path/"dev_score.txt", dev_trial_path)
         dev_eer, dev_tdcf = calculate_tDCF_EER(
@@ -340,25 +358,49 @@ def train_epoch(
     # set objective (Loss) functions
     weight = torch.FloatTensor([0.1, 0.9]).to(device)
     criterion = nn.CrossEntropyLoss(weight=weight)
+    
+    # Enable mixed precision training for faster computation
+    scaler = None
+    if torch.cuda.is_available():
+        scaler = torch.cuda.amp.GradScaler()
+    
     for batch_x, batch_y in trn_loader:
         batch_size = batch_x.size(0)
         num_total += batch_size
         ii += 1
         batch_x = batch_x.to(device)
         batch_y = batch_y.view(-1).type(torch.int64).to(device)
-        _, batch_out = model(batch_x, Freq_aug=str_to_bool(config["freq_aug"]))
-        batch_loss = criterion(batch_out, batch_y)
-        running_loss += batch_loss.item() * batch_size
-        optim.zero_grad()
-        batch_loss.backward()
-        optim.step()
-
-        if config["optim_config"]["scheduler"] in ["cosine", "keras_decay"]:
-            scheduler.step()
-        elif scheduler is None:
-            pass
+        
+        # Use mixed precision training if available
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                _, batch_out = model(batch_x, Freq_aug=str_to_bool(config["freq_aug"]))
+                batch_loss = criterion(batch_out, batch_y)
+            
+            # Scale loss and perform backward pass
+            optim.zero_grad()
+            scaler.scale(batch_loss).backward()
+            scaler.step(optim)
+            scaler.update()
         else:
-            raise ValueError("scheduler error, got:{}".format(scheduler))
+            _, batch_out = model(batch_x, Freq_aug=str_to_bool(config["freq_aug"]))
+            batch_loss = criterion(batch_out, batch_y)
+            optim.zero_grad()
+            batch_loss.backward()
+            optim.step()
+            
+        running_loss += (batch_loss.item() * batch_size)
+        
+        if scheduler is not None:
+            scheduler.step()
+            
+        if ii % 10 == 0:
+            sys.stdout.write('\r \t {:.2f}%'.format(
+                (ii / len(trn_loader)) * 100))
+            
+        # Periodically clear cache to avoid memory issues
+        if ii % 100 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     running_loss /= num_total
     return running_loss
