@@ -73,14 +73,16 @@ class Dataset_ASVspoof2019_train(Dataset):
 
     def __getitem__(self, index):
         key = self.list_IDs[index]
-        # Fixed path construction to avoid duplicate split directory
+        # Match exact Kaggle dataset structure
         if 'LA_T_' in key:
-            split = 'train'
+            split = 'ASVspoof2019_LA_train'
         elif 'LA_D_' in key:
-            split = 'dev'
+            split = 'ASVspoof2019_LA_dev'
         else:  # LA_E_
-            split = 'eval'
-        X, _ = sf.read(str(self.base_dir / f"ASVspoof2019_LA_{split}" / 'flac' / f"{key}.flac"))
+            split = 'ASVspoof2019_LA_eval'
+        full_path = str(self.base_dir / split / 'flac' / f"{key}.flac")
+        print(f"Trying to access file at: {full_path}")  # Debug print
+        X, _ = sf.read(full_path)
         X_pad = pad_random(X, self.cut)
         x_inp = Tensor(X_pad)
         y = self.labels[key]
@@ -100,14 +102,16 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
 
     def __getitem__(self, index):
         key = self.list_IDs[index]
-        # Fixed path construction to avoid duplicate split directory
+        # Match exact Kaggle dataset structure
         if 'LA_T_' in key:
-            split = 'train'
+            split = 'ASVspoof2019_LA_train'
         elif 'LA_D_' in key:
-            split = 'dev'
+            split = 'ASVspoof2019_LA_dev'
         else:  # LA_E_
-            split = 'eval'
-        X, _ = sf.read(str(self.base_dir / f"ASVspoof2019_LA_{split}" / 'flac' / f"{key}.flac"))
+            split = 'ASVspoof2019_LA_eval'
+        full_path = str(self.base_dir / split / 'flac' / f"{key}.flac")
+        print(f"Trying to access file at: {full_path}")  # Debug print
+        X, _ = sf.read(full_path)
         X_pad = pad(X, self.cut)
         x_inp = Tensor(X_pad)
         return x_inp, key
