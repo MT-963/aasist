@@ -73,14 +73,14 @@ class Dataset_ASVspoof2019_train(Dataset):
 
     def __getitem__(self, index):
         key = self.list_IDs[index]
-        # Updated path to include flac subdirectory and dataset split
+        # Fixed path construction to avoid duplicate split directory
         if 'LA_T_' in key:
-            split = 'ASVspoof2019_LA_train'
+            split = 'train'
         elif 'LA_D_' in key:
-            split = 'ASVspoof2019_LA_dev'
+            split = 'dev'
         else:  # LA_E_
-            split = 'ASVspoof2019_LA_eval'
-        X, _ = sf.read(str(self.base_dir / split / 'flac' / f"{key}.flac"))
+            split = 'eval'
+        X, _ = sf.read(str(self.base_dir / f"ASVspoof2019_LA_{split}" / 'flac' / f"{key}.flac"))
         X_pad = pad_random(X, self.cut)
         x_inp = Tensor(X_pad)
         y = self.labels[key]
@@ -100,14 +100,14 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
 
     def __getitem__(self, index):
         key = self.list_IDs[index]
-        # Updated path to include flac subdirectory and dataset split
+        # Fixed path construction to avoid duplicate split directory
         if 'LA_T_' in key:
-            split = 'ASVspoof2019_LA_train'
+            split = 'train'
         elif 'LA_D_' in key:
-            split = 'ASVspoof2019_LA_dev'
+            split = 'dev'
         else:  # LA_E_
-            split = 'ASVspoof2019_LA_eval'
-        X, _ = sf.read(str(self.base_dir / split / 'flac' / f"{key}.flac"))
+            split = 'eval'
+        X, _ = sf.read(str(self.base_dir / f"ASVspoof2019_LA_{split}" / 'flac' / f"{key}.flac"))
         X_pad = pad(X, self.cut)
         x_inp = Tensor(X_pad)
         return x_inp, key
