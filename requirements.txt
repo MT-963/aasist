@@ -1,4 +1,7 @@
 torch>=1.6.0
-torchcontrib
+# torchcontrib is not available via pip for recent torch versions; consider alternatives if needed
 numpy
 soundfile
+tqdm
+matplotlib
+tensorboard

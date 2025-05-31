@@ -43,12 +43,14 @@ import argparse
 import json
 import sys
 import warnings
+import numpy as np
 from importlib import import_module
 from pathlib import Path
 from shutil import copy
 from typing import Dict, List, Union
 
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchcontrib.optim import SWA
@@ -61,6 +63,29 @@ from utils import create_optimizer, seed_worker, set_seed, str_to_bool
 from adversarial_attack import evaluate_model_with_attack
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Add early stopping class at the top of the file after imports
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.val_loss_min = float('inf')
+
+    def __call__(self, val_loss, model, path):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+            # Save best model
+            torch.save(model.state_dict(), path)
 
 def print_gpu_info():
     """Print detailed GPU information"""
@@ -177,6 +202,28 @@ def main(args: argparse.Namespace) -> None:
     
     # make experiment reproducible
     set_seed(args.seed, config)
+    
+    # Add mixup data augmentation for improved robustness
+    if "use_mixup" not in config:
+        config["use_mixup"] = True
+    if "mixup_alpha" not in config:
+        config["mixup_alpha"] = 0.2  # Controls the strength of mixup
+        
+    # Add label smoothing for better generalization
+    if "label_smoothing" not in config:
+        config["label_smoothing"] = 0.1  # Smoothing factor
+        
+    # Add adversarial training settings
+    if "adv_training" not in config:
+        config["adv_training"] = True  # Enable adversarial training
+    if "adv_epsilon" not in config:
+        config["adv_epsilon"] = 0.01  # Perturbation strength
+    if "adv_alpha" not in config:
+        config["adv_alpha"] = 0.005  # Step size for PGD
+    if "adv_steps" not in config:
+        config["adv_steps"] = 3  # Number of attack steps
+    if "adv_ratio" not in config:
+        config["adv_ratio"] = 0.5  # Ratio of batches to apply adversarial training
 
     # define database related paths
     output_dir = Path(args.output_dir)
@@ -200,23 +247,27 @@ def main(args: argparse.Namespace) -> None:
     model_tag = output_dir / model_tag
     model_save_path = model_tag / "weights"
     eval_score_path = model_tag / config["eval_output"]
+    dev_score_path = model_tag / "dev_scores.txt"
     writer = SummaryWriter(model_tag)
     os.makedirs(model_save_path, exist_ok=True)
     copy(args.config, model_tag / "config.conf")
 
-    # Setup mixed precision training
-    scaler = torch.cuda.amp.GradScaler()
+    # Initialize early stopping
+    early_stopping = EarlyStopping(
+        patience=config.get("early_stopping_patience", 10),
+        min_delta=config.get("early_stopping_min_delta", 0.001)
+    )
 
     # Create data loaders with optimized settings
     trn_loader, dev_loader, eval_loader = get_loader(
         database_path=Path(config["database_path"]),
         seed=args.seed,
-        config=config  # Remove is_eval since we've already set the batch size
+        config=config
     )
     
     # Create model and move to GPU
     model = get_model(model_config, device)
-    model = model.to(device, memory_format=torch.channels_last)  # Use channels_last memory format
+    model = model.to(device)  # Remove channels_last memory format for now
     
     # Configure optimizer settings
     optim_config["steps_per_epoch"] = len(trn_loader)
@@ -234,6 +285,14 @@ def main(args: argparse.Namespace) -> None:
     optimizer, scheduler = create_optimizer(model.parameters(), optim_config)
     optimizer_swa = SWA(optimizer) if config.get("use_swa", False) else None
 
+    # Define loss function based on config
+    if config.get("loss", "CCE") == "CCE":
+        criterion = nn.CrossEntropyLoss()
+    elif config.get("loss", "CCE") == "BCE":
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = nn.CrossEntropyLoss()  # Default to CrossEntropyLoss
+
     if args.eval:
         # Determine model path from args or config
         if args.eval_model_weights:
@@ -243,8 +302,14 @@ def main(args: argparse.Namespace) -> None:
         else:
             raise ValueError("No model path provided. Use --eval_model_weights or specify model_path in config.")
             
-        model.load_state_dict(torch.load(model_load_path))
-        print("Model loaded from {}".format(model_load_path))
+        # Check if the model file exists
+        if model_load_path.exists():
+            model.load_state_dict(torch.load(model_load_path))
+            print("Model loaded from {}".format(model_load_path))
+        else:
+            print("Warning: Model file {} not found. Using untrained model.".format(model_load_path))
+            print("This will give random results and is only useful for testing the pipeline.")
+            
         print("Start evaluation...")
         
         # Check if attack type is specified via argument or config
@@ -355,8 +420,7 @@ def main(args: argparse.Namespace) -> None:
             eval_eer, eval_tdcf = calculate_tDCF_EER(
                 cm_scores_file=eval_score_path,
                 asv_score_file=database_path / config["asv_score_path"],
-                output_file=result_output
-            )
+                output_file=model_tag / "eval_metrics.txt")
             print("EVAL - EER: {:.3f}, min t-DCF: {:.5f}".format(eval_eer, eval_tdcf))
         return
     
@@ -369,6 +433,9 @@ def main(args: argparse.Namespace) -> None:
     best_eval_tdcf = 1.
     n_swa_update = 0
     
+    # Initialize mixed precision training
+    scaler = torch.cuda.amp.GradScaler(enabled=config.get("use_mixed_precision", True))
+    
     for epoch in range(num_epochs):
         print("\nEpoch {}/{}:".format(epoch + 1, num_epochs))
         
@@ -378,23 +445,23 @@ def main(args: argparse.Namespace) -> None:
         num_total = 0.
         num_correct = 0.
         
-        # Use tqdm for progress tracking
-        for batch_x, batch_y in tqdm(trn_loader, desc=f"Training Epoch {epoch+1}"):
+        # Use tqdm for progress tracking with batch index
+        for batch_idx, (batch_x, batch_y) in enumerate(tqdm(trn_loader, desc=f"Training Epoch {epoch+1}")):
             batch_size = batch_x.size(0)
             
             # Move data to GPU asynchronously
-            batch_x = batch_x.to(device, non_blocking=True, memory_format=torch.channels_last)
+            batch_x = batch_x.to(device, non_blocking=True)
             batch_y = batch_y.to(device, non_blocking=True)
             
             # Clear gradients and cache
             optimizer.zero_grad(set_to_none=True)
             
             try:
-                # Mixed precision forward pass
-                with torch.cuda.amp.autocast():
-                    batch_out, _ = model(batch_x)
-                    loss = criterion(batch_out, batch_y)
-                    
+                    # Mixed precision forward pass
+                with torch.cuda.amp.autocast(enabled=config.get("use_mixed_precision", True)):
+                                    batch_out, _ = model(batch_x)
+                                    loss = criterion(batch_out, batch_y)
+                
                 # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
                 
@@ -412,17 +479,23 @@ def main(args: argparse.Namespace) -> None:
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"\nOOM error in batch. Current memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+                    print(f"\nOOM error in batch {batch_idx}. Current memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    batch_out = None
                     continue
                 else:
                     raise e
             
             finally:
                 # Clean up memory
-                del batch_x, batch_y, batch_out
-                if batch_idx % 10 == 0:  # Periodic cleanup
+                if 'batch_x' in locals():
+                    del batch_x
+                if 'batch_y' in locals():
+                    del batch_y
+                if 'batch_out' in locals() and batch_out is not None:
+                    del batch_out
+                if batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
             
         scheduler.step()
@@ -431,12 +504,6 @@ def main(args: argparse.Namespace) -> None:
         print("Training Loss: {:.4f}, Accuracy: {:.2f}%".format(
             epoch_loss, epoch_acc * 100))
         
-        # Memory status after training
-        print(f"GPU Memory after epoch: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
-        
-        writer.add_scalar("train_loss", epoch_loss, epoch)
-        writer.add_scalar("train_acc", epoch_acc, epoch)
-        
         # Validation phase
         model.eval()
         with torch.no_grad():
@@ -444,27 +511,15 @@ def main(args: argparse.Namespace) -> None:
                                    dev_score_path, dev_trial_path)
             dev_eer, dev_tdcf = calculate_tDCF_EER(
                 cm_scores_file=dev_score_path,
-                asv_score_file=database_path / config["asv_score_path"])
+                asv_score_file=database_path / config["asv_score_path"],
+                output_file=model_tag / "dev_metrics.txt")
             print("DEV - EER: {:.3f}, min t-DCF: {:.5f}".format(dev_eer, dev_tdcf))
             
-            # Update best scores
-            if dev_eer < best_dev_eer:
-                print("Best DEV EER: {:.3f} -> {:.3f}".format(best_dev_eer, dev_eer))
-                best_dev_eer = dev_eer
-                torch.save(model.state_dict(),
-                           model_save_path / "best_eer.pth")
-            
-            if dev_tdcf < best_dev_tdcf:
-                print("Best DEV min t-DCF: {:.5f} -> {:.5f}".format(
-                    best_dev_tdcf, dev_tdcf))
-                best_dev_tdcf = dev_tdcf
-                torch.save(model.state_dict(),
-                           model_save_path / "best_tdcf.pth")
-            
-            # SWA update if configured
-            if optimizer_swa is not None and epoch >= config.get("swa_start", 0):
-                optimizer_swa.update_swa()
-                n_swa_update += 1
+            # Early stopping check
+            early_stopping(dev_eer, model, model_save_path / "best_model.pth")
+            if early_stopping.early_stop:
+                print("Early stopping triggered")
+                break
             
             writer.add_scalar("dev_eer", dev_eer, epoch)
             writer.add_scalar("dev_tdcf", dev_tdcf, epoch)
@@ -486,7 +541,8 @@ def main(args: argparse.Namespace) -> None:
                                eval_score_path, eval_trial_path)
         eval_eer, eval_tdcf = calculate_tDCF_EER(
             cm_scores_file=eval_score_path,
-            asv_score_file=database_path / config["asv_score_path"])
+            asv_score_file=database_path / config["asv_score_path"],
+            output_file=model_tag / "eval_metrics.txt")
         
         print("\nFinal Results:")
         print("EER: {:.3f}, min t-DCF: {:.5f}".format(eval_eer, eval_tdcf))

@@ -149,134 +149,137 @@ class HtrgGraphAttentionLayer(nn.Module):
 
     def forward(self, x1, x2, master=None):
         '''
-        x1  :(#bs, #node, #dim)
-        x2  :(#bs, #node, #dim)
+        x1: Birinci tip node'lar (ör. temporal node'lar)
+        x2: İkinci tip node'lar (ör. spektral node'lar)
+        master: (isteğe bağlı) master node (özet node)
         '''
-        num_type1 = x1.size(1)
-        num_type2 = x2.size(1)
+        num_type1 = x1.size(1)  # Birinci tip node sayısı (ör. zaman node'ları)
+        num_type2 = x2.size(1)  # İkinci tip node sayısı (ör. frekans node'ları)
 
+        # Her node tipini kendi projeksiyonundan geçir
         x1 = self.proj_type1(x1)
         x2 = self.proj_type2(x2)
 
+        # Tüm node'ları birleştir (hem zaman hem frekans node'ları)
         x = torch.cat([x1, x2], dim=1)
 
+        # Eğer master node verilmemişse, tüm node'ların ortalamasını al
         if master is None:
             master = torch.mean(x, dim=1, keepdim=True)
 
-        # apply input dropout
+        # Dropout uygula (overfitting'i önlemek için)
         x = self.input_drop(x)
 
-        # derive attention map
+        # Tüm node'lar arası attention haritası oluştur
         att_map = self._derive_att_map(x, num_type1, num_type2)
 
-        # directional edge for master node
+        # Master node'u güncelle (tüm node'larla etkileşime sok)
         master = self._update_master(x, master)
 
-        # projection
+        # Attention ile projeksiyon uygula (bilgiyi güncelle)
         x = self._project(x, att_map)
 
-        # apply batch norm
+        # Batch normalization ve aktivasyon uygula
         x = self._apply_BN(x)
         x = self.act(x)
 
-        x1 = x.narrow(1, 0, num_type1)
-        x2 = x.narrow(1, num_type1, num_type2)
+        # Çıktıyı tekrar iki tipe ayır (ilk baştaki node sayılarına göre)
+        x1 = x.narrow(1, 0, num_type1)           # Birinci tip (ör. zaman)
+        x2 = x.narrow(1, num_type1, num_type2)   # İkinci tip (ör. frekans)
 
+        # Güncellenmiş node'ları ve master node'u döndür
         return x1, x2, master
 
     def _update_master(self, x, master):
-
-        att_map = self._derive_att_map_master(x, master)
-        master = self._project_master(x, master, att_map)
-
+        '''
+        Master node'u güncelleyen fonksiyon. Master node, tüm node'larla etkileşime girerek özet bilgi taşır.
+        '''
+        att_map = self._derive_att_map_master(x, master)  # Master ile tüm node'lar arası attention haritası oluştur
+        master = self._project_master(x, master, att_map) # Master node'u attention ile güncelle
         return master
 
     def _pairwise_mul_nodes(self, x):
         '''
-        Calculates pairwise multiplication of nodes.
-        - for attention map
+        Node'lar arası ikili çarpım hesaplar. Attention haritası için kullanılır.
         x           :(#bs, #node, #dim)
         out_shape   :(#bs, #node, #node, #dim)
         '''
-
         nb_nodes = x.size(1)
         x = x.unsqueeze(2).expand(-1, -1, nb_nodes, -1)
         x_mirror = x.transpose(1, 2)
-
-        return x * x_mirror
+        return x * x_mirror  # Her node ile diğer tüm node'ların çarpımı
 
     def _derive_att_map_master(self, x, master):
         '''
-        x           :(#bs, #node, #dim)
-        out_shape   :(#bs, #node, #node, 1)
+        Master node ile tüm node'lar arası attention haritası oluşturur.
         '''
-        att_map = x * master
+        att_map = x * master  # Her node ile master node'un çarpımı
         att_map = torch.tanh(self.att_projM(att_map))
-
         att_map = torch.matmul(att_map, self.att_weightM)
-
-        # apply temperature
+        # Sıcaklık (temperature) ile ölçekle
         att_map = att_map / self.temp
-
+        # Softmax ile normalize et
         att_map = F.softmax(att_map, dim=-2)
-
         return att_map
 
     def _derive_att_map(self, x, num_type1, num_type2):
         '''
-        x           :(#bs, #node, #dim)
-        out_shape   :(#bs, #node, #node, 1)
+        Tüm node'lar arası attention haritası oluşturur.
+        Hem aynı tip (zaman-zaman, frekans-frekans) hem de farklı tip (zaman-frekans) 
+        node'lar arası ilişkiler burada modellenir.
         '''
         att_map = self._pairwise_mul_nodes(x)
-        # size: (#bs, #node, #node, #dim_out)
         att_map = torch.tanh(self.att_proj(att_map))
-        # size: (#bs, #node, #node, 1)
-
         att_board = torch.zeros_like(att_map[:, :, :, 0]).unsqueeze(-1)
-
+        # Zaman-zaman ilişkileri
         att_board[:, :num_type1, :num_type1, :] = torch.matmul(
             att_map[:, :num_type1, :num_type1, :], self.att_weight11)
+        # Frekans-frekans ilişkileri
         att_board[:, num_type1:, num_type1:, :] = torch.matmul(
             att_map[:, num_type1:, num_type1:, :], self.att_weight22)
+        # Zaman-frekans ve frekans-zaman ilişkileri (heterojen)
         att_board[:, :num_type1, num_type1:, :] = torch.matmul(
             att_map[:, :num_type1, num_type1:, :], self.att_weight12)
         att_board[:, num_type1:, :num_type1, :] = torch.matmul(
             att_map[:, num_type1:, :num_type1, :], self.att_weight12)
-
         att_map = att_board
-
-        # att_map = torch.matmul(att_map, self.att_weight12)
-
-        # apply temperature
+        # Sıcaklık (temperature) ile ölçekle
         att_map = att_map / self.temp
-
+        # Softmax ile normalize et
         att_map = F.softmax(att_map, dim=-2)
-
         return att_map
 
     def _project(self, x, att_map):
+        '''
+        Attention haritası ile node'ları günceller (projeksiyon uygular).
+        '''
         x1 = self.proj_with_att(torch.matmul(att_map.squeeze(-1), x))
         x2 = self.proj_without_att(x)
-
-        return x1 + x2
+        return x1 + x2  # Güncellenmiş node'lar
 
     def _project_master(self, x, master, att_map):
-
+        '''
+        Master node'u attention ile günceller.
+        '''
         x1 = self.proj_with_attM(torch.matmul(
             att_map.squeeze(-1).unsqueeze(1), x))
         x2 = self.proj_without_attM(master)
-
         return x1 + x2
 
     def _apply_BN(self, x):
+        '''
+        Batch normalization uygular.
+        '''
         org_size = x.size()
         x = x.view(-1, org_size[-1])
         x = self.bn(x)
         x = x.view(org_size)
-
         return x
 
     def _init_new_params(self, *size):
+        '''
+        Yeni parametre (ağırlık) oluşturur ve xavier ile başlatır.
+        '''
         out = nn.Parameter(torch.FloatTensor(*size))
         nn.init.xavier_normal_(out)
         return out
@@ -542,13 +545,13 @@ class Model(nn.Module):
         e_S, _ = torch.max(torch.abs(e), dim=3)  # max along time
         e_S = e_S.transpose(1, 2) + self.pos_S
 
-        gat_S = self.GAT_layer_S(e_S)
-        out_S = self.pool_S(gat_S)  # (#bs, #node, #dim)
-
         # temporal GAT (GAT-T)
         e_T, _ = torch.max(torch.abs(e), dim=2)  # max along freq
         e_T = e_T.transpose(1, 2)
 
+        gat_S = self.GAT_layer_S(e_S)
+        out_S = self.pool_S(gat_S)  # (#bs, #node, #dim)
+        
         gat_T = self.GAT_layer_T(e_T)
         out_T = self.pool_T(gat_T)
 
