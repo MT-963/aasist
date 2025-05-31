@@ -9,7 +9,7 @@ import zipfile
 
 if __name__ == "__main__":
     url = "https://datashare.ed.ac.uk/bitstream/handle/10283/3336/LA.zip?sequence=3&isAllowed=y"
-    output_path = "./LA.zip"
+    output_path = "./config/LA.zip"
 
     print("Downloading LA.zip...")
     urllib.request.urlretrieve(url, output_path)
