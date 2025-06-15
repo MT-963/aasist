@@ -8,6 +8,8 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 def str_to_bool(val):
@@ -24,10 +26,11 @@ def str_to_bool(val):
     """
     val = val.lower()
     if val in ('y', 'yes', 't', 'true', 'on', '1'):
-        return True
-    if val in ('n', 'no', 'f', 'false', 'off', '0'):
-        return False
-    raise ValueError('invalid truth value {}'.format(val))
+        return 1
+    elif val in ('n', 'no', 'f', 'false', 'off', '0'):
+        return 0
+    else:
+        raise ValueError("invalid truth value %r" % (val))
 
 
 def cosine_annealing(step, total_steps, lr_max, lr_min):
@@ -155,3 +158,60 @@ def set_seed(seed, config = None):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = str_to_bool(config["cudnn_deterministic_toggle"])
         torch.backends.cudnn.benchmark = str_to_bool(config["cudnn_benchmark_toggle"])
+
+
+class AMSoftmaxLoss(nn.Module):
+    """AM-Softmax loss with dynamic margin based on utterance duration.
+    
+    Args:
+        scale (float): Scale factor (s in the paper). Default: 15.
+        adaptive_margin (bool): Whether to use adaptive margin based on duration. Default: False.
+        m_a (float): Slope for margin calculation (A in the paper). Default: 3/50.
+        m_b (float): Intercept for margin calculation (B in the paper). Default: 7/50.
+        m (float): Fixed margin when adaptive_margin is False. Default: 0.2.
+    """
+
+    def __init__(self, scale=15.0, adaptive_margin=False, m_a=3/50, m_b=7/50, m=0.2):
+        super(AMSoftmaxLoss, self).__init__()
+        self.scale = scale  # scale factor (s)
+        self.adaptive_margin = adaptive_margin
+        self.m_a = m_a  # slope for adaptive margin
+        self.m_b = m_b  # intercept for adaptive margin
+        self.m = m  # fixed margin
+
+    def forward(self, outputs, targets, durations=None):
+        """
+        Args:
+            outputs (torch.Tensor): Cosine similarity matrix (batch_size, num_classes).
+            targets (torch.Tensor): Target classes (batch_size).
+            durations (torch.Tensor, optional): Utterance durations in seconds. Required if adaptive_margin is True.
+        """
+        batch_size = outputs.size(0)
+        
+        # Calculate margins for each sample if using adaptive margin
+        if self.adaptive_margin:
+            if durations is None:
+                raise ValueError("Durations must be provided when using adaptive margin")
+            # Calculate margin based on duration: m = A * duration + B
+            margins = self.m_a * durations + self.m_b
+        else:
+            # Use fixed margin for all samples
+            margins = torch.ones_like(targets, dtype=torch.float) * self.m
+        
+        # Convert margins to device of outputs
+        margins = margins.to(outputs.device)
+        
+        # Apply margin to target logits
+        one_hot = torch.zeros_like(outputs)
+        one_hot.scatter_(1, targets.view(-1, 1), 1)
+        
+        # Subtract margin from target class cosine values
+        outputs = outputs - one_hot * margins.view(-1, 1)
+        
+        # Scale all cosine values
+        outputs = outputs * self.scale
+        
+        # Apply cross-entropy loss
+        loss = F.cross_entropy(outputs, targets)
+        
+        return loss

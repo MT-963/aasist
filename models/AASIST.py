@@ -322,6 +322,99 @@ class GraphPool(nn.Module):
         return h
 
 
+class SpeakerConditioningModule(nn.Module):
+    """
+    Module for speaker-aware conditioning in AASIST.
+    Can condition at the frame level or utterance level.
+    """
+    def __init__(self, 
+                 spk_emb_dim: int,
+                 target_dim: int,
+                 conditioning_level: str = "frame",
+                 use_attention: bool = True):
+        """
+        Args:
+            spk_emb_dim (int): Dimension of speaker embedding vector
+            target_dim (int): Dimension of features to condition
+            conditioning_level (str): Either 'frame' or 'utterance'
+            use_attention (bool): Whether to use attention for conditioning
+        """
+        super().__init__()
+        self.conditioning_level = conditioning_level
+        self.use_attention = use_attention
+        
+        # Projection to match dimensions
+        self.proj = nn.Linear(spk_emb_dim, target_dim)
+        
+        if use_attention:
+            # Attention mechanism for better integration
+            self.attention = nn.Sequential(
+                nn.Linear(target_dim * 2, target_dim),
+                nn.Tanh(),
+                nn.Linear(target_dim, 1),
+                nn.Softmax(dim=1)
+            )
+            
+            # Final fusion layer
+            self.fusion = nn.Sequential(
+                nn.Linear(target_dim * 2, target_dim),
+                nn.ReLU()
+            )
+        else:
+            # Simple concatenation and projection
+            self.fusion = nn.Sequential(
+                nn.Linear(target_dim * 2, target_dim),
+                nn.ReLU()
+            )
+    
+    def forward(self, features, speaker_embedding):
+        """
+        Apply speaker conditioning to features
+        
+        Args:
+            features: Features to condition (batch_size, seq_len, dim) for frame-level
+                     or (batch_size, dim) for utterance-level
+            speaker_embedding: Speaker embedding vectors (batch_size, spk_emb_dim)
+        
+        Returns:
+            Conditioned features with the same shape as input features
+        """
+        # Project speaker embedding to match feature dimensions
+        spk_proj = self.proj(speaker_embedding)  # (batch_size, target_dim)
+        
+        if self.conditioning_level == "frame":
+            # Frame-level conditioning
+            batch_size, seq_len, dim = features.size()
+            
+            # Expand speaker embedding to match sequence length
+            spk_proj = spk_proj.unsqueeze(1).expand(-1, seq_len, -1)  # (batch_size, seq_len, target_dim)
+            
+            if self.use_attention:
+                # Compute attention weights
+                concat_feats = torch.cat([features, spk_proj], dim=2)
+                attn_weights = self.attention(concat_feats)  # (batch_size, seq_len, 1)
+                
+                # Apply attention weights
+                spk_context = attn_weights * spk_proj
+                
+                # Fuse features with speaker context
+                conditioned_features = self.fusion(torch.cat([features, spk_context], dim=2))
+            else:
+                # Simple concatenation and projection
+                conditioned_features = self.fusion(torch.cat([features, spk_proj], dim=2))
+                
+        else:  # utterance-level
+            # Utterance-level conditioning
+            if features.dim() == 3:
+                # If features are sequential, pool them to get utterance-level representation
+                features = torch.mean(features, dim=1)  # (batch_size, dim)
+                
+            # Simple concatenation and projection for utterance level
+            conditioned_features = self.fusion(torch.cat([features, spk_proj], dim=1))
+            
+        return conditioned_features
+
+
 class CONV(nn.Module):
     @staticmethod
     def to_mel(hz):
@@ -410,6 +503,121 @@ class CONV(nn.Module):
                         groups=1)
 
 
+class SELayer(nn.Module):
+    """Squeeze-and-Excitation layer"""
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class Res2NetBlock(nn.Module):
+    """Res2Net block with squeeze-and-excitation layer"""
+    def __init__(self, nb_filts, first=False, width=14, scale=8):
+        super().__init__()
+        self.first = first
+        self.width = width
+        self.scale = scale
+        
+        if not self.first:
+            self.bn1 = nn.BatchNorm2d(num_features=nb_filts[0])
+        
+        # Res2Net structure with width and scale
+        self.nums = self.width
+        self.convs = nn.ModuleList()
+        
+        # Split convolutions
+        for i in range(self.nums):
+            self.convs.append(
+                nn.Conv2d(in_channels=nb_filts[0] // self.width + (1 if i == 0 else 0),
+                          out_channels=nb_filts[1] // self.width,
+                          kernel_size=(2, 3),
+                          padding=(1, 1),
+                          stride=1)
+            )
+        
+        self.selu = nn.SELU(inplace=True)
+        self.bn2 = nn.BatchNorm2d(num_features=nb_filts[1])
+        
+        # Final convolution after concatenation
+        self.conv_cat = nn.Conv2d(in_channels=nb_filts[1],
+                                 out_channels=nb_filts[1],
+                                 kernel_size=(2, 3),
+                                 padding=(0, 1),
+                                 stride=1)
+        
+        # Squeeze and excitation layer
+        self.se = SELayer(channel=nb_filts[1], reduction=16)
+        
+        # Downsample if needed
+        if nb_filts[0] != nb_filts[1]:
+            self.downsample = True
+            self.conv_downsample = nn.Conv2d(in_channels=nb_filts[0],
+                                           out_channels=nb_filts[1],
+                                           padding=(0, 1),
+                                           kernel_size=(1, 3),
+                                           stride=1)
+        else:
+            self.downsample = False
+            
+        self.mp = nn.MaxPool2d((1, 3))
+
+    def forward(self, x):
+        identity = x
+        
+        # Initial batch norm if not first block
+        if not self.first:
+            x = self.bn1(x)
+            x = self.selu(x)
+        
+        # Split and process with Res2Net structure
+        spx = torch.split(x, self.width, 1)
+        sp = spx[0]
+        outputs = []
+        
+        for i in range(self.nums):
+            if i == 0:
+                sp = spx[i]
+            else:
+                sp = sp + spx[i] if i % self.scale == 0 else spx[i]
+            sp = self.convs[i](sp)
+            outputs.append(sp)
+            
+        # Concatenate outputs
+        out = torch.cat(outputs, dim=1)
+        
+        # Apply batch norm and second convolution
+        out = self.bn2(out)
+        out = self.selu(out)
+        out = self.conv_cat(out)
+        
+        # Apply SE module
+        out = self.se(out)
+        
+        # Downsample residual if needed
+        if self.downsample:
+            identity = self.conv_downsample(identity)
+            
+        # Add residual connection
+        out += identity
+        
+        # Max pooling
+        out = self.mp(out)
+        
+        return out
+
+
 class Residual_block(nn.Module):
     def __init__(self, nb_filts, first=False):
         super().__init__()
@@ -475,6 +683,25 @@ class Model(nn.Module):
         gat_dims = d_args["gat_dims"]
         pool_ratios = d_args["pool_ratios"]
         temperatures = d_args["temperatures"]
+        
+        # Res2Net parameters
+        res2net_width = d_args.get("res2net_width", 14)
+        res2net_scale = d_args.get("res2net_scale", 8)
+        
+        # Speaker conditioning parameters
+        self.use_speaker_conditioning = d_args.get("speaker_conditioning", False)
+        if self.use_speaker_conditioning:
+            self.spk_emb_dim = d_args.get("spk_emb_dim", 256)
+            self.conditioning_level = d_args.get("conditioning_level", "frame")
+            self.use_attention = d_args.get("use_attention", True)
+            
+            # Create speaker conditioning modules for different features
+            self.spk_cond_gat = SpeakerConditioningModule(
+                spk_emb_dim=self.spk_emb_dim,
+                target_dim=gat_dims[1],
+                conditioning_level=self.conditioning_level,
+                use_attention=self.use_attention
+            )
 
         self.conv_time = CONV(out_channels=filts[0],
                               kernel_size=d_args["first_conv"],
@@ -486,12 +713,12 @@ class Model(nn.Module):
         self.selu = nn.SELU(inplace=True)
 
         self.encoder = nn.Sequential(
-            nn.Sequential(Residual_block(nb_filts=filts[1], first=True)),
-            nn.Sequential(Residual_block(nb_filts=filts[2])),
-            nn.Sequential(Residual_block(nb_filts=filts[3])),
-            nn.Sequential(Residual_block(nb_filts=filts[4])),
-            nn.Sequential(Residual_block(nb_filts=filts[4])),
-            nn.Sequential(Residual_block(nb_filts=filts[4])))
+            nn.Sequential(Res2NetBlock(nb_filts=filts[1], first=True, width=res2net_width, scale=res2net_scale)),
+            nn.Sequential(Res2NetBlock(nb_filts=filts[2], width=res2net_width, scale=res2net_scale)),
+            nn.Sequential(Res2NetBlock(nb_filts=filts[3], width=res2net_width, scale=res2net_scale)),
+            nn.Sequential(Res2NetBlock(nb_filts=filts[4], width=res2net_width, scale=res2net_scale)),
+            nn.Sequential(Res2NetBlock(nb_filts=filts[4], width=res2net_width, scale=res2net_scale)),
+            nn.Sequential(Res2NetBlock(nb_filts=filts[4], width=res2net_width, scale=res2net_scale)))
 
         self.pos_S = nn.Parameter(torch.randn(1, 23, filts[-1][-1]))
         self.master1 = nn.Parameter(torch.randn(1, 1, gat_dims[0]))
@@ -525,8 +752,15 @@ class Model(nn.Module):
 
         self.out_layer = nn.Linear(5 * gat_dims[1], 2)
 
-    def forward(self, x, Freq_aug=False):
-
+    def forward(self, x, Freq_aug=False, speaker_embedding=None):
+        """
+        Forward pass with optional speaker conditioning
+        
+        Args:
+            x: Input audio
+            Freq_aug: Whether to use frequency augmentation
+            speaker_embedding: Optional speaker embedding for conditioning (batch_size, spk_emb_dim)
+        """
         x = x.unsqueeze(1)
         x = self.conv_time(x, mask=Freq_aug)
         x = x.unsqueeze(dim=1)
@@ -591,7 +825,16 @@ class Model(nn.Module):
         out_T = torch.max(out_T1, out_T2)
         out_S = torch.max(out_S1, out_S2)
         master = torch.max(master1, master2)
-
+        
+        # Apply speaker conditioning if enabled and speaker embedding is provided
+        if self.use_speaker_conditioning and speaker_embedding is not None:
+            # Apply conditioning to the fused features before the final layer
+            if self.conditioning_level == "frame":
+                # Apply frame-level conditioning to GAT outputs
+                out_T = self.spk_cond_gat(out_T, speaker_embedding)
+                out_S = self.spk_cond_gat(out_S, speaker_embedding)
+        
+        # Extract statistics
         T_max, _ = torch.max(torch.abs(out_T), dim=1)
         T_avg = torch.mean(out_T, dim=1)
 
@@ -600,6 +843,12 @@ class Model(nn.Module):
 
         last_hidden = torch.cat(
             [T_max, T_avg, S_max, S_avg, master.squeeze(1)], dim=1)
+            
+        # Apply utterance-level speaker conditioning if enabled
+        if self.use_speaker_conditioning and speaker_embedding is not None:
+            if self.conditioning_level == "utterance":
+                # Apply utterance-level conditioning to final representation
+                last_hidden = self.spk_cond_gat(last_hidden, speaker_embedding)
 
         last_hidden = self.drop(last_hidden)
         output = self.out_layer(last_hidden)

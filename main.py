@@ -23,8 +23,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torchcontrib.optim import SWA
 
 from data_utils import (Dataset_ASVspoof2019_train,
-                        Dataset_ASVspoof2019_devNeval, genSpoof_list)
+                        Dataset_ASVspoof2019_deveval, genSpoof_list)
 from evaluation import calculate_tDCF_EER
+import utils
 from utils import create_optimizer, seed_worker, set_seed, str_to_bool
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -253,10 +254,18 @@ def get_loader(
                                             is_train=True,
                                             is_eval=False)
     print("no. training files:", len(file_train))
-
-    train_set = Dataset_ASVspoof2019_train(list_IDs=file_train,
-                                           labels=d_label_trn,
-                                           base_dir=trn_database_path)
+    
+    # Initialize dynamic chunk parameters
+    dcs_enabled = config.get("dynamic_chunk", {}).get("enabled", False)
+    min_samples = config.get("dynamic_chunk", {}).get("min_samples", 16000)
+    max_samples = config.get("dynamic_chunk", {}).get("max_samples", 96000)
+    
+    train_set = Dataset_ASVspoof2019_train(
+        list_IDs=file_train,
+        base_dir=trn_database_path,
+        dcs=dcs_enabled,
+        min_samples=min_samples,
+        max_samples=max_samples)
     gen = torch.Generator()
     gen.manual_seed(seed)
     trn_loader = DataLoader(train_set,
@@ -272,7 +281,7 @@ def get_loader(
                                 is_eval=False)
     print("no. validation files:", len(file_dev))
 
-    dev_set = Dataset_ASVspoof2019_devNeval(list_IDs=file_dev,
+    dev_set = Dataset_ASVspoof2019_deveval(list_IDs=file_dev,
                                             base_dir=dev_database_path)
     dev_loader = DataLoader(dev_set,
                             batch_size=config["batch_size"],
@@ -283,7 +292,7 @@ def get_loader(
     file_eval = genSpoof_list(dir_meta=eval_trial_path,
                               is_train=False,
                               is_eval=True)
-    eval_set = Dataset_ASVspoof2019_devNeval(list_IDs=file_eval,
+    eval_set = Dataset_ASVspoof2019_deveval(list_IDs=file_eval,
                                              base_dir=eval_database_path)
     eval_loader = DataLoader(eval_set,
                              batch_size=config["batch_size"],
@@ -306,10 +315,18 @@ def produce_evaluation_file(
         trial_lines = f_trl.readlines()
     fname_list = []
     score_list = []
-    for batch_x, utt_id in data_loader:
+    for batch_data in data_loader:
+        # Handle updated dataset format that returns (x, y, utt_id)
+        if len(batch_data) == 3:
+            batch_x, _, utt_id = batch_data
+        else:
+            batch_x, utt_id = batch_data
+            
         batch_x = batch_x.to(device)
         with torch.no_grad():
-            _, batch_out = model(batch_x)
+            # No speaker embeddings during evaluation, but the model will handle None properly
+            speaker_embedding = None
+            _, batch_out = model(batch_x, speaker_embedding=speaker_embedding)
             batch_score = (batch_out[:, 1]).data.cpu().numpy().ravel()
         # add outputs
         fname_list.extend(utt_id)
@@ -337,18 +354,61 @@ def train_epoch(
     ii = 0
     model.train()
 
-    # set objective (Loss) functions
-    weight = torch.FloatTensor([0.1, 0.9]).to(device)
-    criterion = nn.CrossEntropyLoss(weight=weight)
-    for batch_x, batch_y in trn_loader:
+    # Set loss function based on configuration
+    if config["loss"] == "CCE":
+        # Cross-entropy loss with class weighting
+        weight = torch.FloatTensor([0.1, 0.9]).to(device)
+        criterion = nn.CrossEntropyLoss(weight=weight)
+        use_duration = False
+    elif config["loss"] == "AM_Softmax":
+        # AM-Softmax loss with adaptive margin
+        scale = config.get("am_softmax_scale", 15.0)
+        adaptive_margin = config.get("adaptive_margin", True)
+        m_a = config.get("margin_a", 3/50)
+        m_b = config.get("margin_b", 7/50)
+        m = config.get("margin", 0.2)
+        
+        criterion = utils.AMSoftmaxLoss(
+            scale=scale,
+            adaptive_margin=adaptive_margin,
+            m_a=m_a,
+            m_b=m_b,
+            m=m
+        )
+        use_duration = adaptive_margin
+    else:
+        raise ValueError(f"Unknown loss type: {config['loss']}")
+    
+    for batch_data in trn_loader:
+        if use_duration and len(batch_data) == 3:  # If using duration info
+            batch_x, batch_y, batch_duration = batch_data
+            batch_duration = batch_duration.view(-1).to(device)
+        else:
+            if len(batch_data) == 3:  # In case dataset returns duration but we don't need it
+                batch_x, batch_y, _ = batch_data
+            else:
+                batch_x, batch_y = batch_data
+            batch_duration = None
+        
         batch_size = batch_x.size(0)
         num_total += batch_size
         ii += 1
+        
         batch_x = batch_x.to(device)
         batch_y = batch_y.view(-1).type(torch.int64).to(device)
+        
+        # Forward pass
         _, batch_out = model(batch_x, Freq_aug=str_to_bool(config["freq_aug"]))
-        batch_loss = criterion(batch_out, batch_y)
+        
+        # Calculate loss based on the selected loss function
+        if use_duration:
+            batch_loss = criterion(batch_out, batch_y, batch_duration)
+        else:
+            batch_loss = criterion(batch_out, batch_y)
+            
         running_loss += batch_loss.item() * batch_size
+        
+        # Backward pass
         optim.zero_grad()
         batch_loss.backward()
         optim.step()
