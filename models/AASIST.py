@@ -527,8 +527,8 @@ class Res2NetBlock(nn.Module):
     def __init__(self, nb_filts, first=False, width=14, scale=8):
         super().__init__()
         self.first = first
-        self.width = width
-        self.scale = scale
+        self.width = min(width, nb_filts[0])  # Ensure width doesn't exceed input channels
+        self.scale = min(scale, self.width)   # Ensure scale doesn't exceed width
         
         if not self.first:
             self.bn1 = nn.BatchNorm2d(num_features=nb_filts[0])
@@ -537,24 +537,51 @@ class Res2NetBlock(nn.Module):
         self.nums = self.width
         self.convs = nn.ModuleList()
         
-        # Split convolutions
+        # Compute per-split channel sizes so that each convolution receives
+        # exactly the same number of channels as produced by the ``torch.split``
+        # call in ``forward``.  All splits except the last get the base size;
+        # the last split receives the remainder.
+        base_in_split = max(1, nb_filts[0] // self.width)
+        in_remainder = nb_filts[0] - base_in_split * (self.width - 1)
+
+        base_out_split = max(1, nb_filts[1] // self.width)
+        out_remainder = nb_filts[1] - base_out_split * (self.width - 1)
+
+        self.split_sizes = []
         for i in range(self.nums):
+            if i < self.width - 1:
+                in_ch = base_in_split
+            else:
+                in_ch = in_remainder
+            
+            # For residual addition to work (sp + spx[i]), the conv should
+            # preserve the number of channels.  Therefore set out_ch = in_ch.
+            out_ch = in_ch
+
+            # Safety guard to avoid zero-channel convolutions
+            in_ch = max(1, in_ch)
+            out_ch = max(1, out_ch)
+
+            self.split_sizes.append(in_ch)
             self.convs.append(
-                nn.Conv2d(in_channels=nb_filts[0] // self.width + (1 if i == 0 else 0),
-                          out_channels=nb_filts[1] // self.width,
-                          kernel_size=(2, 3),
-                          padding=(1, 1),
-                          stride=1)
+                nn.Conv2d(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    kernel_size=(3, 3),
+                    padding=(1, 1),
+                    stride=1
+                )
             )
         
         self.selu = nn.SELU(inplace=True)
-        self.bn2 = nn.BatchNorm2d(num_features=nb_filts[1])
+        # BatchNorm over concatenated splits: channels == nb_filts[0]
+        self.bn2 = nn.BatchNorm2d(num_features=nb_filts[0])
         
         # Final convolution after concatenation
-        self.conv_cat = nn.Conv2d(in_channels=nb_filts[1],
+        self.conv_cat = nn.Conv2d(in_channels=nb_filts[0],
                                  out_channels=nb_filts[1],
-                                 kernel_size=(2, 3),
-                                 padding=(0, 1),
+                                 kernel_size=(3, 3),
+                                 padding=(1, 1),
                                  stride=1)
         
         # Squeeze and excitation layer
@@ -576,23 +603,47 @@ class Res2NetBlock(nn.Module):
     def forward(self, x):
         identity = x
         
+        # Debug print for input shape
+        # print(f"Res2NetBlock input shape: {x.shape}")
+        
         # Initial batch norm if not first block
         if not self.first:
             x = self.bn1(x)
             x = self.selu(x)
         
-        # Split and process with Res2Net structure
-        spx = torch.split(x, self.width, 1)
-        sp = spx[0]
-        outputs = []
+        # Get the number of input channels
+        in_channels = x.size(1)
         
-        for i in range(self.nums):
-            if i == 0:
-                sp = spx[i]
-            else:
-                sp = sp + spx[i] if i % self.scale == 0 else spx[i]
-            sp = self.convs[i](sp)
-            outputs.append(sp)
+        # Calculate the number of channels per split
+        channels_per_split = in_channels // self.width
+        # Ensure we have at least 1 channel per split and not more than input channels
+        channels_per_split = max(1, min(channels_per_split, in_channels))
+        
+        # Adjust width based on actual possible splits
+        actual_width = min(self.width, in_channels)
+        
+        # Split the input tensor along the channel dimension using predefined split sizes
+        spx = torch.split(x, self.split_sizes[:actual_width], dim=1)
+        
+        # Process each split with its corresponding convolution
+        outputs = []
+        for i in range(actual_width):
+            if i < len(self.convs):  # Safety check
+                if i == 0:
+                    sp = spx[i]
+                else:
+                    # Only add if within the same scale group
+                    if i % self.scale == 0 and i > 0:
+                        sp = sp + spx[i]
+                    else:
+                        sp = spx[i]
+                # Apply the corresponding convolution
+                sp = self.convs[i](sp)
+                outputs.append(sp)
+        
+        # If no outputs were processed, return identity
+        if not outputs:
+            return x
             
         # Concatenate outputs
         out = torch.cat(outputs, dim=1)
@@ -627,7 +678,7 @@ class Residual_block(nn.Module):
             self.bn1 = nn.BatchNorm2d(num_features=nb_filts[0])
         self.conv1 = nn.Conv2d(in_channels=nb_filts[0],
                                out_channels=nb_filts[1],
-                               kernel_size=(2, 3),
+                               kernel_size=(3, 3),
                                padding=(1, 1),
                                stride=1)
         self.selu = nn.SELU(inplace=True)
@@ -635,8 +686,8 @@ class Residual_block(nn.Module):
         self.bn2 = nn.BatchNorm2d(num_features=nb_filts[1])
         self.conv2 = nn.Conv2d(in_channels=nb_filts[1],
                                out_channels=nb_filts[1],
-                               kernel_size=(2, 3),
-                               padding=(0, 1),
+                               kernel_size=(3, 3),
+                               padding=(1, 1),
                                stride=1)
 
         if nb_filts[0] != nb_filts[1]:
@@ -757,16 +808,30 @@ class Model(nn.Module):
         Forward pass with optional speaker conditioning
         
         Args:
-            x: Input audio
+            x: Input audio of shape (batch_size, seq_len)
             Freq_aug: Whether to use frequency augmentation
             speaker_embedding: Optional speaker embedding for conditioning (batch_size, spk_emb_dim)
         """
-        x = x.unsqueeze(1)
+        # Ensure input is 3D (batch, 1, seq_len)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # Add channel dimension
+            
+        # Debug print for input shape
+        # print(f"Input to conv_time: {x.shape}")
+        
+        # Apply time convolution (expects 3D input [batch, 1, seq_len])
         x = self.conv_time(x, mask=Freq_aug)
-        x = x.unsqueeze(dim=1)
+        
+        # Add frequency dimension for 2D convolutions
+        x = x.unsqueeze(1)  # Now shape is [batch, 1, channels, time]
+        
+        # Apply max pooling
         x = F.max_pool2d(torch.abs(x), (3, 3))
         x = self.first_bn(x)
         x = self.selu(x)
+        
+        # Debug print after initial processing
+        # print(f"After initial convs: {x.shape}")
 
         # get embeddings using encoder
         # (#bs, #filt, #spec, #seq)

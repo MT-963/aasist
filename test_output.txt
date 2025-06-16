@@ -1,0 +1,75 @@
+Test successful!=== Starting Test ===
+Python version: 3.11.0 (main, Oct 24 2022, 18:26:48) [MSC v.1933 64 bit (AMD64)]
+Working directory: D:\VSCODE\aasist
+
+=== Testing PyTorch ===
+PyTorch version: 2.5.1+cu121
+CUDA available: True
+Created tensor with shape: torch.Size([2, 1, 1600])
+
+=== Testing Model Import ===
+
+=== Testing Model Creation ===
+Model created successfully!
+
+=== Testing Forward Pass ===
+
+=== Test Failed ===
+Error: Given groups=1, weight of size [2, 6, 2, 3], expected input[2, 2, 23, 163] to have 6 channels, but got 2 channels instead
+Traceback:
+Traceback (most recent call last):
+  File "D:\VSCODE\aasist\file_test.py", line 47, in <module>
+    output = model(x)
+             ^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\VSCODE\aasist\models\AASIST.py", line 850, in forward
+    e = self.encoder(x)
+        ^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\container.py", line 250, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\container.py", line 250, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\VSCODE\aasist\models\AASIST.py", line 626, in forward
+    sp = self.convs[i](sp)
+         ^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\conv.py", line 554, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\MAHMUDTAME\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\conv.py", line 549, in _conv_forward
+    return F.conv2d(
+           ^^^^^^^^^
+RuntimeError: Given groups=1, weight of size [2, 6, 2, 3], expected input[2, 2, 23, 163] to have 6 channels, but got 2 channels instead
+
+
+=== End of Test ===

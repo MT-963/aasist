@@ -1,0 +1,6 @@
+Res2NetBlock input shape: torch.Size([4, 1, 23, 490])
+After bn2 and selu: torch.Size([4, 32, 24, 490])
+After se: torch.Size([4, 32, 23, 490])
+After downsample: torch.Size([4, 32, 23, 490])
+After residual: torch.Size([4, 32, 23, 490])
+After mp: torch.Size([4, 32, 23, 163])

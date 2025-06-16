@@ -10,11 +10,13 @@ import argparse
 import json
 import os
 import sys
+import time
 import warnings
 from importlib import import_module
 from pathlib import Path
 from shutil import copy
 from typing import Dict, List, Union
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -135,11 +137,31 @@ def main(args: argparse.Namespace) -> None:
 
     # Training
     for epoch in range(config["num_epochs"]):
-        print("Start training epoch{:03d}".format(epoch))
-        running_loss = train_epoch(trn_loader, model, optimizer, device,
-                                   scheduler, config)
+        print("\n" + "="*50)
+        print(f"Epoch {epoch+1:03d}/{config['num_epochs']:03d}")
+        print("="*50)
+        
+        # Train for one epoch with progress bar
+        running_loss = train_epoch(
+            trn_loader=trn_loader,
+            model=model,
+            optim=optimizer,
+            device=device,
+            scheduler=scheduler,
+            config=config,
+            progress_bar=tqdm(
+                total=len(trn_loader),
+                desc=f"Epoch {epoch+1:03d}",
+                unit='batch',
+                dynamic_ncols=True,
+                leave=True
+            )
+        )
+        
+        # Evaluation
+        print("\nEvaluating on dev set...")
         produce_evaluation_file(dev_loader, model, device,
-                                metric_path/"dev_score.txt", dev_trial_path)
+                              metric_path/"dev_score.txt", dev_trial_path)
         dev_eer, dev_tdcf = calculate_tDCF_EER(
             cm_scores_file=metric_path/"dev_score.txt",
             asv_score_file=database_path/config["asv_score_path"],
@@ -274,6 +296,7 @@ def get_loader(
                             drop_last=True,
                             pin_memory=True,
                             worker_init_fn=seed_worker,
+                            collate_fn=train_set.collate_fn,
                             generator=gen)
 
     _, file_dev = genSpoof_list(dir_meta=dev_trial_path,
@@ -344,15 +367,27 @@ def produce_evaluation_file(
 def train_epoch(
     trn_loader: DataLoader,
     model,
-    optim: Union[torch.optim.SGD, torch.optim.Adam],
+    optim: torch.optim.Optimizer,
     device: torch.device,
     scheduler: torch.optim.lr_scheduler,
-    config: argparse.Namespace):
+    config: argparse.Namespace,
+    progress_bar=None):
     """Train the model for one epoch"""
-    running_loss = 0
-    num_total = 0.0
-    ii = 0
+    running_loss = 0.0
+    running_correct = 0
+    num_total = 0
     model.train()
+    
+    # Initialize progress bar if not provided
+    if progress_bar is None:
+        progress_bar = tqdm(
+            
+            total=len(trn_loader),
+            desc="Training",
+            unit='batch',
+            dynamic_ncols=True,
+            leave=True
+        )
 
     # Set loss function based on configuration
     if config["loss"] == "CCE":
@@ -392,7 +427,6 @@ def train_epoch(
         
         batch_size = batch_x.size(0)
         num_total += batch_size
-        ii += 1
         
         batch_x = batch_x.to(device)
         batch_y = batch_y.view(-1).type(torch.int64).to(device)
@@ -406,6 +440,10 @@ def train_epoch(
         else:
             batch_loss = criterion(batch_out, batch_y)
             
+        # Calculate accuracy
+        _, predicted = torch.max(batch_out, 1)
+        correct = (predicted == batch_y).sum().item()
+        running_correct += correct
         running_loss += batch_loss.item() * batch_size
         
         # Backward pass
@@ -413,15 +451,33 @@ def train_epoch(
         batch_loss.backward()
         optim.step()
 
+        # Update learning rate if needed
         if config["optim_config"]["scheduler"] in ["cosine", "keras_decay"]:
             scheduler.step()
-        elif scheduler is None:
-            pass
-        else:
-            raise ValueError("scheduler error, got:{}".format(scheduler))
+        
+        # Update progress bar
+        avg_loss = running_loss / num_total
+        accuracy = 100. * running_correct / num_total
+        progress_bar.set_postfix({
+            'loss': f'{avg_loss:.4f}',
+            'acc': f'{accuracy:.2f}%',
+            'lr': optim.param_groups[0]['lr']
+        })
+        progress_bar.update(1)
+        
+        # Optional: Add a small delay to prevent progress bar flickering
+        time.sleep(0.01)
 
-    running_loss /= num_total
-    return running_loss
+    # Close progress bar if we created it
+    if progress_bar is not None and progress_bar.total == len(trn_loader):
+        progress_bar.close()
+    
+    # Calculate final metrics
+    avg_loss = running_loss / num_total
+    accuracy = 100. * running_correct / num_total
+    
+    print(f"\nTraining - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
+    return avg_loss
 
 
 if __name__ == "__main__":
