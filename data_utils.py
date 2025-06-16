@@ -194,13 +194,10 @@ class Dataset_ASVspoof2019_train(Dataset):
             return X_tensor, y, 0.0
 
 class Dataset_ASVspoof2019_deveval(Dataset):
-    def __init__(self, list_IDs, base_dir):
+    def __init__(self, list_IDs, base_dir, label_dict=None):
         self.list_IDs = list_IDs
         self.base_dir = base_dir
-        self.label_dict = {
-            'spoof': 1,
-            'bonafide': 0
-        }
+        self.label_dict = label_dict  # Optional
 
     def __len__(self):
         return len(self.list_IDs)
@@ -209,5 +206,9 @@ class Dataset_ASVspoof2019_deveval(Dataset):
         utt_id = self.list_IDs[index]
         X, fs = sf.read(os.path.join(self.base_dir, "flac", utt_id + ".flac"))
         X = pad(X)
-        y = self.label_dict[utt_id.split('/')[1].split('-')[4].split('.')[0]]
+        if self.label_dict is not None:
+            y = self.label_dict[utt_id]
+        else:
+            y = -1  # For eval
         return torch.FloatTensor(X), torch.LongTensor([y]), utt_id
+

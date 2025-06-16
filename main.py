@@ -212,14 +212,24 @@ def main(args: argparse.Namespace) -> None:
     print("Start final evaluation")
     epoch += 1
     if n_swa_update > 0:
+        print("Swapping SWA and updating batch norm...")
         optimizer_swa.swap_swa_sgd()
         optimizer_swa.bn_update(trn_loader, model, device=device)
+
+    print("Producing evaluation file for eval set...")
+    start_time = time.time()
     produce_evaluation_file(eval_loader, model, device, eval_score_path,
                             eval_trial_path)
+    print(f"produce_evaluation_file finished in {time.time() - start_time:.2f} seconds.")
+
+    print("Calculating tDCF and EER for eval set...")
+    start_time = time.time()
     eval_eer, eval_tdcf = calculate_tDCF_EER(cm_scores_file=eval_score_path,
                                              asv_score_file=database_path /
                                              config["asv_score_path"],
                                              output_file=model_tag / "t-DCF_EER.txt")
+    print(f"calculate_tDCF_EER finished in {time.time() - start_time:.2f} seconds.")
+
     f_log = open(model_tag / "metric_log.txt", "a")
     f_log.write("=" * 5 + "\n")
     f_log.write("EER: {:.3f}, min t-DCF: {:.5f}".format(eval_eer, eval_tdcf))
@@ -275,7 +285,9 @@ def get_loader(
     d_label_trn, file_train = genSpoof_list(dir_meta=trn_list_path,
                                             is_train=True,
                                             is_eval=False)
-    print("no. training files:", len(file_train))
+    # DEBUG: Use only a small subset for fast debugging
+    file_train = file_train[:100]
+    print("no. training files (debug):", len(file_train))
     
     # Initialize dynamic chunk parameters
     dcs_enabled = config.get("dynamic_chunk", {}).get("enabled", False)
@@ -302,7 +314,9 @@ def get_loader(
     _, file_dev = genSpoof_list(dir_meta=dev_trial_path,
                                 is_train=False,
                                 is_eval=False)
-    print("no. validation files:", len(file_dev))
+    # DEBUG: Use only a small subset for fast debugging
+    file_dev = file_dev[:50]
+    print("no. validation files (debug):", len(file_dev))
 
     dev_set = Dataset_ASVspoof2019_deveval(list_IDs=file_dev,
                                             base_dir=dev_database_path)
@@ -315,6 +329,10 @@ def get_loader(
     file_eval = genSpoof_list(dir_meta=eval_trial_path,
                               is_train=False,
                               is_eval=True)
+    # DEBUG: Use only a small subset for fast debugging
+    file_eval = file_eval[:50]
+    print("no. evaluation files (debug):", len(file_eval))
+
     eval_set = Dataset_ASVspoof2019_deveval(list_IDs=file_eval,
                                              base_dir=eval_database_path)
     eval_loader = DataLoader(eval_set,
@@ -335,10 +353,16 @@ def produce_evaluation_file(
     """Perform evaluation and save the score to a file"""
     model.eval()
     with open(trial_path, "r") as f_trl:
-        trial_lines = f_trl.readlines()
+        all_trial_lines = f_trl.readlines()
+    # Only keep lines for utt_ids in the current dev set
+    dev_utt_ids = set([utt_id for utt_id in data_loader.dataset.list_IDs])
+    trial_lines = [line for line in all_trial_lines if line.split()[1] in dev_utt_ids]
+
     fname_list = []
     score_list = []
-    for batch_data in data_loader:
+    total_batches = len(data_loader)
+    for i, batch_data in enumerate(data_loader):
+        print(f"Processing batch {i+1}/{total_batches}...", flush=True)
         # Handle updated dataset format that returns (x, y, utt_id)
         if len(batch_data) == 3:
             batch_x, _, utt_id = batch_data
